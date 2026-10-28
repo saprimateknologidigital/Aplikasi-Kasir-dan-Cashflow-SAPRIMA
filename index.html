@@ -70,6 +70,7 @@ h1,h2,h3{margin:0;text-wrap:balance;letter-spacing:-.01em}
 .gnote{font-size:12px;color:var(--forest-muted);line-height:1.6}
 .gnote code{background:rgba(255,255,255,.1);padding:1px 6px;border-radius:6px;color:#fff}
 .gerr{color:#FFB4B6;font-size:13px;min-height:20px}
+#gate .inp{color:var(--ink)}
 
 /* ---------- Shell ---------- */
 #app{display:grid;grid-template-columns:236px minmax(0,1fr);height:100%}
@@ -372,8 +373,10 @@ const initials = s => s.split(/\s+/).filter(Boolean).slice(0,2).map(w => w[0]).j
 const parseRp = v => Number(String(v).replace(/[^\d]/g,'')) || 0;
 
 /* ================= Data ================= */
-const KEY = 'tera-kasir-demo-v1';
+// Source of truth is Supabase (see Cloud below). KEY only caches the business data plus this device's kasir session, cart and open bills.
+const KEY = 'tera-kasir-v2';
 let S;
+const blank = () => ({usaha:{nama:'',footer:'',ig:''}, cabang:[], users:[], kategori:[], produk:[], trx:[], hold:[], seq:{}, shift:{}, shiftLog:[], kas:[], session:null, cart:{}});
 
 function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
 
@@ -454,9 +457,10 @@ function nextNo(st, cab, ms){
   st.seq[k] = (st.seq[k]||0) + 1;
   return `TR-${cab}-${ymd(ms)}-${String(st.seq[k]).padStart(4,'0')}`;
 }
-function load(){ try { const r = localStorage.getItem(KEY); return r ? JSON.parse(r) : null; } catch(e){ return null; } }
-function save(){ try { localStorage.setItem(KEY, JSON.stringify(S)); } catch(e){} }
-S = load() || seed();
+function load(){ try { const r = JSON.parse(localStorage.getItem(KEY)); return r && r.bid && r.S ? r : null; } catch(e){ return null; } }
+function persist(){ try { if (S && Cloud.bid) localStorage.setItem(KEY, JSON.stringify({bid:Cloud.bid, S})); } catch(e){} }
+// Every feature calls save() right after changing S: queue what changed for Supabase, then cache locally.
+function save(){ Cloud.track(); persist(); }
 
 /* ================= State ================= */
 const ui = { view:'kasir', cat:'all', q:'', period:'7', cabF:'cur', lapQ:'', lapP:'hari', pdfOri:'auto', dbQ:'', gate:{step:'pos',pos:null,user:null,pin:''} };
@@ -490,7 +494,8 @@ const WAVES = `<svg class="waves" viewBox="0 0 400 800" preserveAspectRatio="xMi
 
 function renderGate(){
   const g = ui.gate;
-  const stepIdx = {pos:0,user:1,pin:2}[g.step];
+  const stepIdx = {pos:0,user:1,pin:2}[g.step] ?? -1;
+  const terminal = stepIdx >= 0;
   let body = '';
   if (g.step === 'pos') {
     body = `<h2>Pilih terminal</h2>
@@ -504,7 +509,7 @@ function renderGate(){
         <span class="av" style="background:${u.warna}">${initials(u.nama)}</span>
         <div><b>${esc(u.nama)}</b><small>${u.role}</small></div></button>`).join('')}
       <button class="glink" data-act="g-back">Ganti terminal</button>`;
-  } else {
+  } else if (g.step === 'pin') {
     const u = S.users.find(x => x.id === g.user);
     body = `<div style="display:flex;flex-direction:column;align-items:center;gap:8px">
         <span class="av" style="background:${u.warna};width:56px;height:56px;font-size:20px">${initials(u.nama)}</span>
@@ -515,21 +520,55 @@ function renderGate(){
         <button data-act="g-back" style="font-size:14px">Kembali</button><button data-act="g-key" data-k="0">0</button>
         <button data-act="g-del" aria-label="Hapus" style="font-size:14px">Hapus</button></div>
       <button class="glink" data-act="g-forgot">Lupa PIN?</button>`;
-  }
+  } else body = cloudGate(g);
   $('#gate').innerHTML = WAVES + `<div class="gcard">
     <div class="brand">${LOGO}tera</div>
-    <div class="gtitle">Gerbang Terminal</div>
-    <div class="gpanel"><div class="gsteps">${[0,1,2].map(i=>`<i class="${i<=stepIdx?'on':''}"></i>`).join('')}</div>${body}</div>
-    <div class="gnote">Mode contoh · PIN: Endow (Owner) <code>111111</code>, Ibik <code>222222</code>, Sari <code>333333</code></div>
+    <div class="gtitle">${terminal ? 'Gerbang Terminal' : 'Akun Bisnis'}</div>
+    <div class="gpanel">${terminal ? `<div class="gsteps">${[0,1,2].map(i=>`<i class="${i<=stepIdx?'on':''}"></i>`).join('')}</div>` : ''}${body}</div>
+    ${terminal && S.usaha.contoh ? `<div class="gnote">Mode contoh · PIN: Endow (Owner) <code>111111</code>, Ibik <code>222222</code>, Sari <code>333333</code></div>` : ''}
+    ${g.step === 'pos' && Cloud.email ? `<div class="gnote">Akun bisnis: ${esc(Cloud.email)} · <button class="glink" data-act="g-signout">Keluar dari HP ini</button></div>` : ''}
   </div>`;
+}
+// Owner sign-in, first-time setup and connection steps shown before the terminal gate.
+function cloudGate(g){
+  if (g.step === 'auth') return `<h2>${g.daftar ? 'Daftar akun bisnis' : 'Masuk akun bisnis'}</h2>
+      <div class="gnote" style="margin-top:-6px">Owner masuk sekali di HP ini. Setelah itu kasir cukup memakai PIN.</div>
+      <form id="f-auth" style="display:flex;flex-direction:column;gap:10px">
+        <input class="inp" id="a-email" type="email" placeholder="Email owner" autocomplete="username" required value="${esc(g.email||'')}" autofocus>
+        <input class="inp" id="a-pass" type="password" placeholder="Kata sandi (min. 6 karakter)" autocomplete="${g.daftar?'new-password':'current-password'}" required minlength="6">
+        <div class="gerr" id="gerr" aria-live="polite"></div>
+        <button class="btn mint" type="submit">${g.daftar ? 'Daftar' : 'Masuk'}</button>
+      </form>
+      <button class="glink" data-act="g-daftar">${g.daftar ? 'Sudah punya akun? Masuk' : 'Belum punya akun? Daftar'}</button>`;
+  if (g.step === 'setup') return `<h2>Siapkan bisnis</h2>
+      <div class="gnote" style="margin-top:-6px">Akun ${esc(Cloud.email)} belum punya data.</div>
+      <button class="posbtn" data-act="g-contoh"><div><b>Isi data contoh</b><small>2 cabang, 3 pengguna, 14 menu, riwayat 14 hari</small></div><span class="tag">Coba</span></button>
+      <form id="f-setup" style="display:flex;flex-direction:column;gap:10px;text-align:left">
+        <div class="gnote">Atau mulai dari kosong:</div>
+        <input class="inp" id="s-usaha" placeholder="Nama usaha" required>
+        <input class="inp" id="s-owner" placeholder="Nama owner (tampil di kasir)" required>
+        <input class="inp" id="s-pin" inputmode="numeric" pattern="\\d{6}" maxlength="6" placeholder="PIN owner 6 digit" required>
+        <div class="gerr" id="gerr" aria-live="polite"></div>
+        <button class="btn mint" type="submit">Mulai</button>
+      </form>
+      <button class="glink" data-act="g-signout">Pakai akun lain</button>`;
+  return `<h2>${Cloud.msg ? 'Belum terhubung' : 'Menghubungkan…'}</h2>
+      <div class="gnote">${esc(Cloud.msg || 'Memuat data bisnis dari server.')}</div>
+      ${Cloud.msg ? `<button class="btn mint" data-act="g-retry">Coba lagi</button>` : ''}`;
+}
+async function pinHash(uid, pin){
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${Cloud.bid}:${uid}:${pin}`));
+  return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2,'0')).join('');
 }
 function gateKey(k){
   const g = ui.gate; if (g.step !== 'pin' || g.pin.length >= 6) return;
   g.pin += k; renderGate();
   if (g.pin.length === 6) {
     const u = S.users.find(x => x.id === g.user);
-    if (u.pin === g.pin) setTimeout(()=>login(g.pos, u.id), 120);
-    else setTimeout(()=>{ g.pin=''; renderGate(); const d=$('#pindots'); d.classList.add('err'); $('#gerr').textContent='PIN salah. Coba lagi.'; }, 150);
+    pinHash(u.id, g.pin).then(h => {
+      if (u.pin === h) setTimeout(()=>login(g.pos, u.id), 120);
+      else setTimeout(()=>{ g.pin=''; renderGate(); const d=$('#pindots'); d.classList.add('err'); $('#gerr').textContent='PIN salah. Coba lagi.'; }, 150);
+    });
   }
 }
 document.addEventListener('keydown', e => {
@@ -562,13 +601,13 @@ function renderShell(){
     <div class="sfoot">
       <div class="who"><span class="av" style="background:${u.warna}">${initials(u.nama)}</span><div><b>${esc(u.nama)}</b><small>${u.role} · ${c.pos}</small></div></div>
       <button class="sbtn" data-act="lock">${I.lock}Ganti kasir / kunci</button>
-      <button class="sbtn" data-act="reset-ask">${I.reset}Reset data contoh</button>
+      ${isOwner() ? `<button class="sbtn" data-act="reset-ask">${I.reset}Reset data contoh</button>` : ''}
     </div>`;
   $('#bnav').innerHTML = NAV.map(([id,t,ic])=>`<button class="${ui.view===id?'on':''}" data-act="nav" data-v="${id}">${ic}<span>${t.replace('Kas & Shift','Shift')}</span></button>`).join('');
   $('#top').innerHTML = `<h1>${TITLES[ui.view]}</h1>
     <span class="chip">${c.pos} · ${esc(c.nama)}</span>
-    <span class="chip ok hide-sm" title="Data tersimpan di perangkat ini"><span class="dot"></span>Tersimpan lokal</span>
-    <span class="chip demo hide-sm">Mode contoh</span>
+    ${syncChip()}
+    ${S.usaha.contoh ? `<span class="chip demo hide-sm">Mode contoh</span>` : ''}
     <button class="btn sm mobile-only" data-act="lock" aria-label="Ganti kasir">${I.lock}${esc(u.nama)}</button>`;
 }
 function renderApp(){
@@ -1199,7 +1238,15 @@ const ACT = {
   'kat-del-do': el => katDelDo(el.dataset.id),
   'kat-form': () => openModal(mHead('Tambah kategori') + `<form class="mb" id="f-kat"><div class="field"><label for="kt-nama">Nama kategori</label><input class="inp" id="kt-nama" required autofocus placeholder="Contoh: Minuman dingin"></div><div class="mf" style="padding:0;border:0"><button type="button" class="btn" data-act="close">Batal</button><button class="btn pri" type="submit">Simpan</button></div></form>`),
   'reset-ask': () => openModal(mHead('Reset data contoh') + `<div class="mb"><p style="margin:0">Semua transaksi, stok, dan shift di perangkat ini kembali ke data contoh awal.</p></div><div class="mf"><button class="btn" data-act="close">Batal</button><button class="btn danger" data-act="reset-do">Reset</button></div>`),
-  'reset-do': () => { try { localStorage.removeItem(KEY); } catch(e){} S = seed(); save(); closeModal(); ui.gate={step:'pos',pos:null,user:null,pin:''}; $('#app').hidden = true; $('#gate').hidden = false; renderGate(); toast('Data contoh dipulihkan'); },
+  'reset-do': async () => {
+    if (!Cloud.ready || !navigator.onLine) { toast('Reset butuh koneksi internet'); return; }
+    closeModal(); toast('Mengisi ulang data contoh…');
+    try { await Cloud.seedBusiness(seed(), true); } catch(e) { toast('Reset gagal: ' + (e.message || e)); return; }
+    ui.gate={step:'pos',pos:null,user:null,pin:''}; $('#app').hidden = true; $('#gate').hidden = false; renderGate(); toast('Data contoh dipulihkan'); },
+  'g-daftar': () => { ui.gate.daftar = !ui.gate.daftar; ui.gate.email = $('#a-email')?.value || ''; renderGate(); },
+  'g-contoh': el => { el.disabled = true; Cloud.seedBusiness(seed()).then(enterApp, e => { el.disabled = false; toast('Gagal mengisi data: ' + (e.message || e)); }); },
+  'g-signout': () => Cloud.signOut(),
+  'g-retry': () => Cloud.start(),
 };
 document.addEventListener('click', e => {
   const el = e.target.closest('[data-act]');
@@ -1259,7 +1306,7 @@ document.addEventListener('submit', e => {
     if (fis === null) { toast('Isi uang fisik hasil hitung dulu'); return; }
     const d = fis - x.seharusnya, al = $('#alasan').value.trim();
     if (d !== 0 && !al) { toast('Ada selisih. Isi catatan dulu.'); $('#alasan').focus(); return; }
-    S.shiftLog.push({cab:cid, mulai:x.sh.mulai, tutup:Date.now(), oleh:me().nama, kasAwal:x.sh.kasAwal, seharusnya:x.seharusnya, fisik:fis, selisih:d, catatan:al});
+    S.shiftLog.push({cab:cid, mulai:x.sh.mulai, tutup:Date.now(), oleh:me().nama, dibuka:x.sh.oleh, kasAwal:x.sh.kasAwal, seharusnya:x.seharusnya, fisik:fis, selisih:d, catatan:al});
     S.shift[cid] = {open:false}; save();
     toast(d===0 ? 'Shift ditutup. Kas pas.' : `Shift ditutup dengan selisih ${rp(d)}`);
     lockScreen();
@@ -1285,6 +1332,18 @@ document.addEventListener('submit', e => {
     const k = S.kategori.find(x=>x.id===f.dataset.id); if (!k) return;
     k.nama = nama; save(); closeModal(); renderDb(); toast('Kategori diperbarui');
   }
+  else if (f.id === 'f-auth') Cloud.signIn($('#a-email').value.trim(), $('#a-pass').value, f.querySelector('[type=submit]'));
+  else if (f.id === 'f-setup') {
+    const pin = $('#s-pin').value.trim();
+    if (!/^\d{6}$/.test(pin)) { $('#gerr').textContent = 'PIN harus 6 angka.'; return; }
+    const b = blank();
+    b.usaha = {nama:$('#s-usaha').value.trim(), footer:'Terima kasih, sampai jumpa lagi!', ig:'', contoh:false};
+    b.cabang = [{id:'01', nama:'Cabang Utama', pos:'POS-01', alamat:''}];
+    b.users = [{id:'u1', nama:$('#s-owner').value.trim(), role:'Owner', pin, warna:'#2EE59D'}];
+    b.kategori = [{id:'c1', nama:'Umum', warna:'#2E9E6E'}];
+    f.querySelector('[type=submit]').disabled = true;
+    Cloud.seedBusiness(b).then(enterApp, e => { f.querySelector('[type=submit]').disabled = false; $('#gerr').textContent = 'Gagal menyimpan: ' + (e.message || e); });
+  }
   else if (f.id === 'f-kat') {
     const nama = $('#kt-nama').value.trim(); if (!nama) return;
     const pal = ['#2E9E6E','#0E6B50','#8A5A3B','#C27A14','#3A7CA5','#9B4F96','#B5523B'];
@@ -1292,9 +1351,304 @@ document.addEventListener('submit', e => {
   }
 });
 
+/* ================= Cloud (Supabase) ================= */
+// The URL and publishable key are meant to be public; what each account can read is enforced by Row Level Security (supabase/schema.sql).
+const SB_URL = 'https://ksmcncvbfwaaeiilpkni.supabase.co';
+const SB_KEY = 'sb_publishable_O1ytGzrecW6Xo6m3qM2NgQ_r9wbOSV0';
+const SB_LIB = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/dist/umd/supabase.js';
+const OUTBOX = 'tera-outbox-v2';
+const KEEP_DAYS = 62; // dashboard compares 30 days with the 30 before; older history stays on the server only
+let sb = null;
+
+// How each synced table maps to S. out() gives rows without business_id; set(rows) rebuilds that part of S.
+const byOrder = f => (a,b) => a[f] < b[f] ? -1 : a[f] > b[f] ? 1 : 0;
+const DEFS = [
+  {n:'usaha', table:'businesses', ord:'id', key:() => 'x',
+    out:() => [{nama:S.usaha.nama, footer:S.usaha.footer, ig:S.usaha.ig, contoh:!!S.usaha.contoh, versi:S.usaha.versi||1}],
+    set:rows => { const r = rows[0]; if (r) S.usaha = {nama:r.nama, footer:r.footer, ig:r.ig, contoh:r.contoh, versi:r.versi}; }},
+  {n:'cabang', table:'branches', ord:'id', key:r => r.id,
+    out:() => S.cabang.map(c => ({id:c.id, nama:c.nama, pos:c.pos, alamat:c.alamat})),
+    set:rows => { S.cabang = rows.slice().sort(byOrder('id')).map(r => ({id:r.id, nama:r.nama, pos:r.pos, alamat:r.alamat})); }},
+  {n:'users', table:'staff', ord:'id', key:r => r.id,
+    out:() => S.users.map(u => ({id:u.id, nama:u.nama, role:u.role, pin_hash:u.pin, warna:u.warna})),
+    set:rows => { S.users = rows.slice().sort(byOrder('id')).map(r => ({id:r.id, nama:r.nama, role:r.role, pin:r.pin_hash, warna:r.warna})); }},
+  {n:'kategori', table:'categories', ord:'id', key:r => r.id, soft:true,
+    out:() => S.kategori.map((k,i) => ({id:k.id, nama:k.nama, warna:k.warna, urut:i, dihapus:false})),
+    set:rows => { S.kategori = rows.filter(r => !r.dihapus).sort(byOrder('urut')).map(r => ({id:r.id, nama:r.nama, warna:r.warna})); }},
+  {n:'produk', table:'products', ord:'id', key:r => r.id,
+    out:() => S.produk.map((p,i) => ({id:p.id, nama:p.nama, kat:p.kat, jenis:p.jenis, harga:p.harga, hpp:p.hpp, min:p.min, aktif:p.aktif, urut:i})),
+    set:rows => { const old = new Map(S.produk.map(p => [p.id, p]));
+      S.produk = rows.slice().sort(byOrder('urut')).map(r => ({id:r.id, nama:r.nama, kat:r.kat, jenis:r.jenis, harga:r.harga, hpp:r.hpp, min:r.min, aktif:r.aktif, stok:old.get(r.id)?.stok || {}})); }},
+  {n:'trx', table:'transactions', ord:'id', since:'waktu', key:r => r.id,
+    out:() => S.trx.map(t => ({id:t.id, no:t.no, cab:t.cab, kasir:t.kasir, waktu:t.waktu, items:t.items, sub:t.sub, disc:t.disc, total:t.total, metode:t.metode,
+      bayar:t.bayar, kembali:t.kembali, status:t.status, alasan:t.alasan ?? null, batal_oleh:t.batalOleh ?? null, pelanggan:t.pelanggan || ''})),
+    set:rows => {
+      S.trx = rows.slice().sort(byOrder('waktu')).map(r => { const t = {id:r.id, no:r.no, cab:r.cab, kasir:r.kasir, waktu:r.waktu, items:r.items, sub:r.sub, disc:r.disc, total:r.total,
+        metode:r.metode, bayar:r.bayar, kembali:r.kembali, status:r.status, pelanggan:r.pelanggan}; if (r.alasan) t.alasan = r.alasan; if (r.batal_oleh) t.batalOleh = r.batal_oleh; return t; });
+      // keep nota numbers continuing from what other devices already used
+      S.seq = {}; for (const t of S.trx) { const m = /^TR-(.+)-(\d{8})-(\d+)$/.exec(t.no); if (m) { const k = m[1]+'-'+m[2]; S.seq[k] = Math.max(S.seq[k]||0, +m[3]); } } }},
+  {n:'shift', table:'shifts', ord:'mulai', since:'mulai', key:r => r.branch_id + '|' + r.mulai,
+    out:() => { const closed = S.shiftLog.map(s => ({branch_id:s.cab, mulai:s.mulai, status:'closed', kas_awal:s.kasAwal, dibuka_oleh:s.dibuka ?? null, tutup:s.tutup, ditutup_oleh:s.oleh,
+        seharusnya:s.seharusnya, fisik:s.fisik, selisih:s.selisih, catatan:s.catatan || ''}));
+      const done = new Set(closed.map(r => r.branch_id + '|' + r.mulai));
+      return closed.concat(Object.entries(S.shift).filter(([c,s]) => s.open && !done.has(c + '|' + s.mulai)).map(([c,s]) => ({branch_id:c, mulai:s.mulai, status:'open', kas_awal:s.kasAwal,
+        dibuka_oleh:s.oleh, tutup:null, ditutup_oleh:null, seharusnya:null, fisik:null, selisih:null, catatan:null}))); },
+    set:rows => {
+      S.shiftLog = rows.filter(r => r.status === 'closed').sort(byOrder('tutup')).map(r => ({cab:r.branch_id, mulai:r.mulai, tutup:r.tutup, oleh:r.ditutup_oleh, dibuka:r.dibuka_oleh,
+        kasAwal:r.kas_awal, seharusnya:r.seharusnya, fisik:r.fisik, selisih:r.selisih, catatan:r.catatan || ''}));
+      S.shift = {}; for (const r of rows.filter(r => r.status === 'open').sort(byOrder('mulai'))) S.shift[r.branch_id] = {open:true, kasAwal:r.kas_awal, mulai:r.mulai, oleh:r.dibuka_oleh}; }},
+  {n:'kas', table:'cash_movements', ord:'id', since:'waktu', key:r => r.id,
+    out:() => S.kas.map(k => ({id:k.id, cab:k.cab, tipe:k.tipe, nominal:k.nominal, ket:k.ket, waktu:k.waktu, oleh:k.oleh})),
+    set:rows => { S.kas = rows.slice().sort(byOrder('waktu')).map(r => ({id:r.id, cab:r.cab, tipe:r.tipe, nominal:r.nominal, ket:r.ket, waktu:r.waktu, oleh:r.oleh})); }},
+];
+const DEF = Object.fromEntries(DEFS.map(d => [d.n, d]));
+const STOCK = {n:'stok', table:'stock'};
+const rowsMap = d => new Map(d.out().map(r => [d.key(r), JSON.stringify(r)]));
+const stockOut = () => { const m = new Map(); for (const p of S.produk) for (const [c,q] of Object.entries(p.stok || {})) m.set(p.id + '|' + c, q || 0); return m; };
+const newOpId = () => crypto.randomUUID ? crypto.randomUUID() : '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, c => (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16));
+// retry: network/auth hiccup, try again later · schema: tables missing · fatal: server rejected this data
+const errKind = (e, status) => { const c = e?.code || '', m = e?.message || '';
+  if (/PGRST20[25]|42P01|42883/.test(c)) return 'schema';
+  if (!c || status === 0 || status >= 500 || /^PGRST[03]/.test(c) || /fetch|network|timeout|load failed/i.test(m)) return 'retry';
+  return 'fatal'; };
+
+const Cloud = {
+  bid:null, email:'', ready:false, offline:false, msg:'', schemaErr:'',
+  box:[], dead:[],        // outbox: changes not yet confirmed by the server, kept in localStorage so they survive reloads
+  snap:null, snapStock:null, srv:null, ch:null, flushing:false, pulling:null, lastPull:0,
+
+  loadBox(){ try { const o = JSON.parse(localStorage.getItem(OUTBOX)); if (o && o.bid === this.bid) { this.box = o.box || []; this.dead = o.dead || []; } } catch(e){} this.box.forEach(o => delete o.busy); },
+  saveBox(){ try { localStorage.setItem(OUTBOX, JSON.stringify({bid:this.bid, box:this.box, dead:this.dead})); } catch(e){} },
+  resnap(){ this.snap = new Map(DEFS.map(d => [d.n, rowsMap(d)])); this.snapStock = stockOut(); },
+  pendingUp(n, k){ return this.box.some(o => o.t === 'up' && o.n === n && o.k === k); },
+  pendingDelta(k){ return this.box.reduce((s,o) => s + (o.t === 'st' && o.k === k ? o.d : 0), 0); },
+  // Server stock plus this device's unsent stock changes.
+  applyStock(){ if (!this.srv) return; const P = new Map(S.produk.map(p => [p.id, p])); S.produk.forEach(p => p.stok = {});
+    for (const [k,q] of this.srv) { const [pid,c] = k.split('|'); const p = P.get(pid); if (p) p.stok[c] = q; }
+    for (const o of this.box) if (o.t === 'st') { const [pid,c] = o.k.split('|'); const p = P.get(pid); if (p) p.stok[c] = (p.stok[c] || 0) + o.d; } },
+
+  // Diff S against the last synced state and queue the differences.
+  track(){
+    if (!this.snap || !S) return;
+    for (const d of DEFS) {
+      const now = rowsMap(d), old = this.snap.get(d.n);
+      for (const [k,j] of now) if (old.get(k) !== j) this.enqueue({t:'up', n:d.n, k, row:JSON.parse(j)});
+      if (d.soft) for (const [k,j] of old) if (!now.has(k)) this.enqueue({t:'up', n:d.n, k, row:{...JSON.parse(j), dihapus:true}});
+      this.snap.set(d.n, now);
+    }
+    // stock goes up as deltas so sales on two phones add up instead of overwriting each other
+    const st = stockOut();
+    for (const k of new Set([...st.keys(), ...this.snapStock.keys()])) { const d = (st.get(k) || 0) - (this.snapStock.get(k) || 0); if (d) this.box.push({t:'st', k, d, op:newOpId()}); }
+    this.snapStock = st;
+    this.saveBox(); setStatus(); setTimeout(() => this.flush(), 0);
+  },
+  enqueue(op){ const i = this.box.findIndex(o => o.t === 'up' && o.n === op.n && o.k === op.k && !o.busy); if (i >= 0) this.box[i] = op; else this.box.push(op); },
+
+  async flush(){
+    if (this.flushing || !this.ready || !sb) return;
+    this.flushing = true;
+    try {
+      while (this.box.length) {
+        const head = this.box[0], batch = [];
+        let res;
+        if (head.t === 'st') {
+          for (const o of this.box) { if (o.t !== 'st' || batch.length >= 200) break; batch.push(o); }
+          batch.forEach(o => o.busy = true);
+          res = await sb.rpc('apply_stock_deltas', {ops:batch.map(o => { const [product, branch] = o.k.split('|'); return {op:o.op, product, branch, delta:o.d}; })});
+        } else {
+          const seen = new Set();
+          for (const o of this.box) { if (o.t !== 'up' || o.n !== head.n || seen.has(o.k) || batch.length >= 200) break; seen.add(o.k); batch.push(o); }
+          batch.forEach(o => o.busy = true);
+          const d = DEF[head.n];
+          res = await sb.from(d.table).upsert(batch.map(o => d.table === 'businesses' ? {...o.row, id:this.bid} : {...o.row, business_id:this.bid}));
+        }
+        batch.forEach(o => delete o.busy);
+        if (res.error) {
+          const kind = errKind(res.error, res.status);
+          if (kind === 'retry') { this.offline = true; break; }
+          if (kind === 'schema') { this.schemaErr = 'Tabel Supabase belum dibuat. Jalankan supabase/schema.sql.'; break; }
+          this.dead.push(...batch.map(o => ({op:o, err:res.error.message, at:Date.now()})));
+          toast(`${batch.length} data ditolak server: ${res.error.message}`);
+        }
+        this.offline = false; this.schemaErr = '';
+        this.box = this.box.filter(o => !batch.includes(o));
+        if (head.t === 'st') { this.applyStock(); this.snapStock = stockOut(); }
+        this.saveBox(); setStatus();
+      }
+    } finally { this.flushing = false; setStatus(); }
+  },
+
+  // Load everything for this business; this device's unsent changes are laid on top.
+  async pull(){
+    const since = dayStart(Date.now()) - KEEP_DAYS*DAY;
+    const all = async (table, ord, mod) => { let out = [];
+      for (let from = 0; ; from += 1000) {
+        const {data, error, status} = await mod(sb.from(table).select('*')).order(ord).range(from, from + 999);
+        if (error) throw Object.assign(new Error(error.message), {kind:errKind(error, status)});
+        out = out.concat(data); if (data.length < 1000) return out;
+      } };
+    const lists = await Promise.all([...DEFS.map(d => all(d.table, d.ord, q => d.n === 'shift' ? q.or(`status.eq.open,mulai.gte.${since}`) : d.since ? q.gte(d.since, since) : q)),
+      all('stock', 'product_id', q => q)]);
+    if (!lists[0].length) return false;
+    if (!S) S = blank();
+    DEFS.forEach((d,i) => { const rows = lists[i], at = new Map(rows.map((r,j) => [d.key(r), j]));
+      for (const o of this.box) if (o.t === 'up' && o.n === d.n) { const j = at.get(o.k); if (j == null) { at.set(o.k, rows.length); rows.push(o.row); } else rows[j] = o.row; }
+      d.set(rows); });
+    this.srv = new Map(lists[DEFS.length].map(r => [r.product_id + '|' + r.branch_id, r.qty]));
+    this.applyStock(); this.resnap();
+    if (S.session && !(S.users.some(u => u.id === S.session.user) && S.cabang.some(c => c.id === S.session.cab))) S.session = null;
+    this.lastPull = Date.now(); this.offline = false; this.schemaErr = '';
+    persist();
+    return true;
+  },
+  // Re-sync after being offline or in the background; realtime may have missed changes meanwhile.
+  refresh(){
+    if (!this.ready || this.pulling) return this.pulling;
+    this.pulling = this.pull().then(ok => { if (!ok) return; if (!this.ch) this.subscribe(); softRender(); }, e => { if (e.kind === 'retry') this.offline = true; setStatus(); }).finally(() => { this.pulling = null; this.flush(); });
+    return this.pulling;
+  },
+
+  subscribe(){
+    if (this.ch) sb.removeChannel(this.ch);
+    let ch = sb.channel('tera-' + this.bid), first = true;
+    // INSERT and UPDATE only: the app never hard-deletes rows (categories use the dihapus flag)
+    for (const d of [...DEFS, STOCK]) for (const event of ['INSERT','UPDATE'])
+      ch = ch.on('postgres_changes', {event, schema:'public', table:d.table, filter:`${d.table === 'businesses' ? 'id' : 'business_id'}=eq.${this.bid}`}, p => this.remote(d, p.new));
+    this.ch = ch.subscribe(st => { if (st === 'SUBSCRIBED') { if (!first) this.refresh(); first = false; } });
+  },
+  remote(d, row){
+    if (!S || !this.snap) return;
+    if (d === STOCK) { this.srv.set(row.product_id + '|' + row.branch_id, row.qty); this.applyStock(); this.snapStock = stockOut(); }
+    else {
+      const k = d.key(row);
+      if (this.pendingUp(d.n, k)) return; // our newer local version is still on its way up
+      if (d.n === 'usaha' && row.versi !== S.usaha.versi) { this.refresh(); return; } // data was reset on another device
+      const rows = d.out(), i = rows.findIndex(r => d.key(r) === k);
+      if (i < 0) rows.push(row); else rows[i] = row;
+      d.set(rows);
+      if (d.n === 'produk') { this.applyStock(); this.snapStock = stockOut(); }
+      this.snap.set(d.n, rowsMap(d));
+    }
+    persist(); softRender();
+  },
+
+  async start(){
+    this.msg = '';
+    if (!S) renderGate();
+    try { if (!window.supabase?.createClient) await new Promise((ok,no) => { const s = document.createElement('script'); s.src = SB_LIB; s.onload = ok; s.onerror = () => { s.remove(); no(); }; document.head.appendChild(s); }); }
+    catch(e) { this.offline = true; setStatus(); if (!S) this.gateMsg('Tidak ada koneksi internet. Sambungkan HP ke internet untuk masuk pertama kali.'); return; }
+    if (!sb) {
+      sb = window.supabase.createClient(SB_URL, SB_KEY);
+      sb.auth.onAuthStateChange(ev => { if (ev === 'SIGNED_OUT') setTimeout(() => this.needAuth(), 0); });
+    }
+    const {data, error} = await sb.auth.getSession();
+    if (data?.session) return this.connect(data.session);
+    if (error && errKind(error) === 'retry') { this.offline = true; setStatus(); if (!S) this.gateMsg('Tidak ada koneksi internet.'); return; }
+    this.needAuth();
+  },
+  async connect(session){
+    const bid = session.user.id;
+    this.email = session.user.email || '';
+    if (this.bid !== bid) { S = null; this.bid = bid; this.box = []; this.dead = []; this.loadBox(); }
+    if (!S) { ui.gate = {step:'loading'}; $('#app').hidden = true; $('#gate').hidden = false; renderGate(); }
+    let ok;
+    try { ok = await this.pull(); }
+    catch(e) {
+      if (e.kind === 'schema') this.schemaErr = 'Tabel Supabase belum dibuat. Jalankan supabase/schema.sql.';
+      else this.offline = true;
+      setStatus();
+      if (!S || !S.cabang.length) this.gateMsg(e.kind === 'schema' ? this.schemaErr : e.kind === 'retry' ? 'Tidak ada koneksi internet.' : e.message);
+      else this.ready = true; // keep selling from the cached data; the outbox waits
+      return;
+    }
+    if (!ok) { S = null; ui.gate = {step:'setup'}; $('#app').hidden = true; $('#gate').hidden = false; renderGate(); return; }
+    this.ready = true;
+    this.subscribe();
+    this.flush();
+    if (!$('#gate').hidden && !['pos','user','pin'].includes(ui.gate.step)) enterApp(); else softRender();
+  },
+  gateMsg(m){ this.msg = m; if (!$('#gate').hidden || !S) { ui.gate = {step:'loading'}; $('#app').hidden = true; $('#gate').hidden = false; renderGate(); } },
+  needAuth(){
+    this.ready = false; this.email = '';
+    if (this.ch) { sb.removeChannel(this.ch); this.ch = null; }
+    ui.gate = {step:'auth', email:ui.gate.email || ''}; closeModal(); $('#app').hidden = true; $('#gate').hidden = false; renderGate();
+  },
+  async signIn(email, password, btn){
+    const err = $('#gerr'); err.style.color = ''; err.textContent = '';
+    if (!sb) { err.textContent = 'Belum terhubung ke server. Periksa internet lalu muat ulang.'; return; }
+    btn.disabled = true; ui.gate.email = email;
+    const {data, error} = ui.gate.daftar
+      ? await sb.auth.signUp({email, password, options:{emailRedirectTo:location.origin + location.pathname}})
+      : await sb.auth.signInWithPassword({email, password});
+    btn.disabled = false;
+    if (error) { err.textContent = /invalid login/i.test(error.message) ? 'Email atau kata sandi salah.' : /not confirmed/i.test(error.message) ? 'Email belum dikonfirmasi. Buka link di email dulu.' : /already registered/i.test(error.message) ? 'Email ini sudah terdaftar. Silakan masuk.' : error.message; return; }
+    if (!data.session) { ui.gate.daftar = false; renderGate(); $('#gerr').style.color = 'var(--mint)'; $('#gerr').textContent = 'Akun dibuat. Buka link konfirmasi di email, lalu masuk di sini.'; return; }
+    this.connect(data.session);
+  },
+  async signOut(){
+    if (this.box.length) { toast(`Masih ada ${this.box.length} data belum terkirim. Sambungkan internet dulu.`); return; }
+    try { await sb?.auth.signOut({scope:'local'}); } catch(e){}
+    try { localStorage.removeItem(KEY); localStorage.removeItem(OUTBOX); } catch(e){}
+    S = null; this.bid = null; this.snap = null; this.srv = null;
+    this.needAuth();
+  },
+  // Replace this business's data with `data` (sample or a fresh start) and upload it all.
+  async seedBusiness(data, reset){
+    if (reset) { const {error} = await sb.rpc('reset_business_data'); if (error) throw new Error(error.message); }
+    data.usaha.contoh = data.usaha.contoh ?? true;
+    data.usaha.versi = (S?.usaha?.versi || 0) + 1;
+    for (const u of data.users) u.pin = await pinHash(u.id, u.pin);
+    this.box = []; this.dead = [];
+    S = data; this.srv = new Map();
+    this.snap = new Map(DEFS.map(d => [d.n, new Map()])); this.snapStock = new Map();
+    save();
+    this.ready = true; this.subscribe();
+    await this.flush();
+    if (this.box.length) throw new Error(this.schemaErr || 'Koneksi terputus, data akan dikirim otomatis.');
+    await this.pull();
+  },
+};
+
+function syncChip(){
+  const n = Cloud.box.length;
+  const [cls, txt, tip] = Cloud.schemaErr ? ['demo', 'Database belum siap', Cloud.schemaErr]
+    : Cloud.dead.length ? ['demo', `${Cloud.dead.length} data gagal terkirim`, Cloud.dead[Cloud.dead.length-1].err]
+    : (Cloud.offline || !navigator.onLine) ? ['demo', n ? `Offline · ${n} menunggu` : 'Offline', 'Data disimpan di HP ini dan dikirim otomatis saat online lagi']
+    : n ? ['', `Mengirim ${n} data`, 'Sedang dikirim ke server']
+    : ['ok', 'Tersinkron', 'Semua data sudah tersimpan di server'];
+  return `<span class="chip ${cls} ${cls === 'ok' ? 'hide-sm' : ''}" id="syncchip" title="${esc(tip)}"><span class="dot"></span>${txt}</span>`;
+}
+function setStatus(){ const el = $('#syncchip'); if (el) el.outerHTML = syncChip(); }
+// Redraw after data arrived from another device, without stealing focus from someone typing.
+let softT;
+function softRender(){
+  clearTimeout(softT);
+  softT = setTimeout(() => {
+    if (!S) return;
+    if (!$('#gate').hidden) { if (['pos','user'].includes(ui.gate.step)) renderGate(); return; }
+    if (!sess()) return;
+    const a = document.activeElement, typing = a && a.closest?.('#view') && a.matches('input,select,textarea');
+    if (ui.view === 'kasir') { if ($('#pos')) refreshCart(); setStatus(); }
+    else if (!typing) renderApp();
+  }, 150);
+}
+
 /* ================= Boot ================= */
-if (S.session && S.users.some(u=>u.id===S.session.user)) { $('#gate').hidden = true; $('#app').hidden = false; renderApp(); if (!shiftOf(sess().cab)?.open) openShiftModal(); }
-else { S.session = null; renderGate(); }
+function enterApp(){
+  if (S.session && S.users.some(u=>u.id===S.session.user)) { $('#gate').hidden = true; $('#app').hidden = false; renderApp(); if (!shiftOf(sess().cab)?.open) openShiftModal(); }
+  else { S.session = null; ui.gate = {step:'pos',pos:null,user:null,pin:''}; $('#app').hidden = true; $('#gate').hidden = false; renderGate(); }
+}
+{
+  const c = load();
+  if (c) { S = c.S; Cloud.bid = c.bid; Cloud.loadBox(); Cloud.resnap(); enterApp(); }
+  else { ui.gate = {step:'loading'}; renderGate(); }
+  Cloud.start();
+  addEventListener('online', () => { Cloud.offline = false; setStatus(); if (Cloud.ready) Cloud.refresh(); else Cloud.start(); });
+  addEventListener('offline', setStatus);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && Cloud.ready && Date.now() - Cloud.lastPull > 15e3) Cloud.refresh(); });
+  setInterval(() => Cloud.flush(), 20e3);
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
+}
 </script>
 
 </body></html>
